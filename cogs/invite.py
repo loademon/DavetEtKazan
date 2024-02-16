@@ -1,7 +1,7 @@
 import discord
 import redis.asyncio as redis
-from discord.ext import commands
-from pprint import pprint
+from datetime import datetime, timezone
+from discord.ext import commands, tasks
 
 
 class SpamButton(discord.ui.View):
@@ -31,8 +31,23 @@ class SpamButton(discord.ui.View):
                 ephemeral=True,
             )
 
-        if not await self.r.exists(f"info:{user_id}"):
+        now = datetime.now(timezone.utc)
+
+        if (now - interaction.user.created_at).days < 30:
             await self.r.hset(f"info:{user_id}", "checked", "True")
+            return await interaction.followup.send(
+                "Spam kontrolü tamamlandı. Ancak davet olarak sayılmadı. (Hesap yaşı 1 aydan az.)",
+                ephemeral=True,
+            )
+
+        # if interaction.user.flags.did_rejoin:
+        #     await self.r.hset(f"info:{user_id}", "checked", "True")
+        #     return await interaction.followup.send(
+        #         "Spam kontrolü tamamlandı. Ancak davet olarak sayılmadı. (Kullanıcı sunucudan çıkıp tekrar katıldı.)",
+        #         ephemeral=True,
+        #     )
+
+        if not await self.r.exists(f"info:{user_id}"):
             return await interaction.followup.send(
                 "Spam kontrolü tamamlanamadı. (Kişi başka birinin daveti ile katılmamış.)",
                 ephemeral=True,
@@ -53,14 +68,12 @@ class SpamButton(discord.ui.View):
         inviter_id = inviter_id.decode("utf-8")
 
         if inviter_id is None:
-            await self.r.hset(f"info:{user_id}", "checked", "True")
             return await interaction.followup.send(
                 "Spam kontrolü başlatılamadı. (Kişi başka birinin daveti ile katılmamış.)",
                 ephemeral=True,
             )
 
         if inviter_id == interaction.user.id:
-            await self.r.hset(f"info:{user_id}", "checked", "True")
             return await interaction.followup.send(
                 "Spam kontrolü başlatılamadı. (Kişi kendi daveti ile katılmış. Çakkaaaal :D)",
                 ephemeral=True,
@@ -68,7 +81,6 @@ class SpamButton(discord.ui.View):
 
         inviter = await self.bot.fetch_user(inviter_id)
         if inviter is None:
-            await self.r.hset(f"info:{user_id}", "checked", "True")
             return await interaction.followup.send(
                 "Spam kontrolü başlatılamadı. (Sunucuya davet aracılığıyla katılmış ancak davet eden kişi şu an sunucuda değil.)",
                 ephemeral=True,
@@ -87,13 +99,14 @@ class Invite(commands.Cog):
         self.bot = bot
         self.r = redis.Redis(host="localhost", port=6379, db=2)
         self.invites = {}
-        self.invite_channel_id = 1197597072967356536
+        self.invite_channel_id = 1185641908400300132
         self.invite_channel: discord.TextChannel = None
         self.invite_log_message = None
+        self.update_invites.start()
 
     async def cog_load(self) -> None:
         self.bot.add_view(SpamButton(self.bot))
-        guild_id = 1197256636679598193
+        guild_id = 951884318198874192
         guild = await self.bot.fetch_guild(guild_id)
         print(f"listening {guild.name}")
 
@@ -107,11 +120,15 @@ class Invite(commands.Cog):
         for invite in invites:
             if invite.code == code:
                 return invite
+        return None
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member) -> None:
         invites_before_join = self.invites[member.guild.id]
         invites_after_join = await member.guild.invites()
+
+        for invite in invites_after_join:
+            print(invite.code, invite.uses)
 
         # if member.flags.did_rejoin:
         #     return
@@ -120,10 +137,11 @@ class Invite(commands.Cog):
             return
 
         for invite in invites_before_join:
-            if (
-                invite.uses
-                < self.find_invite_by_code(invites_after_join, invite.code).uses
-            ):
+            finded_invite = self.find_invite_by_code(invites_after_join, invite.code)
+            if finded_invite is None:
+                continue
+
+            if invite.uses < finded_invite.uses:
                 print(f"{invite.inviter} invited {member} to {member.guild}")
                 # await self.r.zadd("Ivites", {invite.inviter.id: 1}, incr=True)
                 # deleted this ^ version beacuse we are not want to count invites before joined user is write a message
@@ -133,6 +151,16 @@ class Invite(commands.Cog):
                 # if user leave the guild we will also delete if we have already counted the user's invites.
 
         self.invites[member.guild.id] = invites_after_join
+
+    @commands.Cog.listener()
+    async def on_invite_create(self, invite: discord.Invite) -> None:
+        print(f"{invite.inviter} created invite {invite} in {invite.guild}")
+        await self.r.hset(f"invite:{invite.code}", "inviter", invite.inviter.id)
+        await self.r.hset(f"invite:{invite.code}", "uses", invite.uses)
+        self.invites[invite.guild.id] = await invite.guild.invites()
+        for invite_x in self.invites[invite.guild.id]:
+            if invite_x.code == invite.code:
+                print("Invite:", invite_x.code, invite_x.uses)
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
@@ -145,6 +173,13 @@ class Invite(commands.Cog):
             return
 
         invite_count = await self.r.zscore("Ivites", member_inviter)
+        if invite_count is None:
+            return
+        try:
+            invite_count = invite_count.decode("utf-8")
+        except:
+            pass
+
         invite_count = int(invite_count)
 
         if invite_count <= 0:
@@ -152,9 +187,40 @@ class Invite(commands.Cog):
 
         await self.r.zadd("Ivites", {member_inviter: -1}, incr=True)
 
-        # TODO: edit invite log message
+        invite_channel = await self.bot.fetch_channel(self.invite_channel_id)
+        # get Ivites sorted set from redis
+        invites = await self.r.zrevrange("Ivites", 0, -1, withscores=True)
+        invites = dict(invites)
+        # embed for invite scores
+        embed = discord.Embed(title="Davet Skorları", color=discord.Color.blurple())
+        for invite_id, invite_count in invites.items():
+            invite = await self.bot.fetch_user(int(invite_id.decode("utf-8")))
+            embed.add_field(name=invite.name, value=int(invite_count), inline=False)
+        await invite_channel.purge(limit=100)
+        await invite_channel.send(embed=embed)
 
-    @commands.has_any_role(1197596893832818809, 1197596898891149353)  # Kurucu, Yönetici
+    @tasks.loop(seconds=30)
+    async def update_invites(self):
+        invite_channel = await self.bot.fetch_channel(self.invite_channel_id)
+        # get Ivites sorted set from redis
+        invites = await self.r.zrevrange("Ivites", 0, -1, withscores=True)
+        invites = dict(invites)
+        print("Listeyi güncelliyorum")
+        # embed for invite scores
+        embed = discord.Embed(title="Davet Skorları", color=discord.Color.blurple())
+        for invite_id, invite_count in invites.items():
+            if int(invite_count) == 0:
+                continue
+            invite = await self.bot.fetch_user(int(invite_id.decode("utf-8")))
+            embed.add_field(name=invite.name, value=int(invite_count), inline=False)
+        await invite_channel.purge(limit=100)
+        await invite_channel.send(embed=embed)
+
+    @update_invites.before_loop
+    async def before_update_invites(self):
+        await self.bot.wait_until_ready()
+
+    @commands.has_any_role(1185604201242431608, 1185605115302924440)  # Kurucu, Yönetici
     @commands.command(name="davet-kontrol")
     async def spam_checker(self, ctx: commands.Context):
         content = "Lütfen aşağıdaki butona tıklayarak spam kontrolünü tamamlayınız."
@@ -170,8 +236,8 @@ class Invite(commands.Cog):
             return
 
         if message.channel.id not in [
-            1197597141502267473,
-            1197597146984231004,
+            1185996673223233648,
+            1196357456494870628,
         ]:  # tr genel, en genel
             return
 
